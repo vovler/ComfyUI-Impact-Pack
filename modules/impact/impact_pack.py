@@ -2476,6 +2476,12 @@ class ImpactSchedulerAdapter:
 
 class DetailerForBatch:
     @staticmethod
+    def tensor_resize_hq(tensor, width, height):
+        """High-quality tensor resize using utils.tensor_resize (LANCZOS) - same as regular DetailerForEach"""
+        # Use the same high-quality resize method as regular DetailerForEach
+        return tensor_resize(tensor, width, height)
+    
+    @staticmethod
     def calculate_face_size_percentage(seg_bbox, image_shape):
         """Calculate face area as percentage of total image area"""
         image_area = image_shape[1] * image_shape[2]  # height * width
@@ -2508,10 +2514,10 @@ class DetailerForBatch:
         new_height = int(orig_height * scale)
         new_width = int(orig_width * scale)
         
-        # Resize to the new dimensions using tensor_resize (preserving aspect ratio)
-        face_resized = tensor_resize(face_tensor, new_width, new_height)
+        # Resize to the new dimensions using high-quality tensor_resize (preserving aspect ratio)
+        face_resized = DetailerForBatch.tensor_resize_hq(face_tensor, new_width, new_height)
         
-        # Create padded tensor
+        # Create padded tensor with efficient allocation
         padded_tensor = torch.zeros((batch_size, target_height, target_width, channels), 
                                   dtype=face_tensor.dtype, device=face_tensor.device)
         
@@ -2535,7 +2541,7 @@ class DetailerForBatch:
     
     @staticmethod
     def remove_padding_and_resize_back(face_tensor, padding_info, original_height, original_width):
-        """Remove padding and resize back to original dimensions"""
+        """Remove padding and resize back to original dimensions """
         # Extract the actual face content (remove padding)
         pad_top = padding_info['pad_top']
         pad_left = padding_info['pad_left']
@@ -2545,8 +2551,8 @@ class DetailerForBatch:
         # Extract the non-padded region
         face_cropped = face_tensor[:, pad_top:pad_top+new_height, pad_left:pad_left+new_width, :]
         
-        # Resize back to original dimensions using tensor_resize
-        face_resized = tensor_resize(face_cropped, original_width, original_height)
+        # Resize back to original dimensions using high-quality tensor_resize
+        face_resized = DetailerForBatch.tensor_resize_hq(face_cropped, original_width, original_height)
         
         return face_resized
 
@@ -2582,18 +2588,20 @@ class DetailerForBatch:
     @staticmethod
     def detect_faces_batch(images, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size):
         """Batch face detection using BBOX detector"""
-        print(f"[BatchDetection] BBOX: Processing {len(images)} images in batch")
+        batch_size = images.shape[0]
+        print(f"[BatchDetection] BBOX: Processing {batch_size} images in batch")
         
         segs_list = []
+        bbox_detector.setAux('face')
         
         # Process each image - for now keep individual processing as BBOX detectors may not support true batching
-        for i, image in enumerate(images):
-            bbox_detector.setAux('face')
+        for i in range(batch_size):
+            image = images[i:i+1]  # Keep batch dimension but extract single image
             segs = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
-            bbox_detector.setAux(None)
             segs_list.append(segs)
             print(f"    -> Image {i+1}: Found {len(segs[1])} faces")
         
+        bbox_detector.setAux(None)
         return segs_list
     
     @staticmethod
@@ -2602,16 +2610,19 @@ class DetailerForBatch:
         if sam_model_opt is None:
             return segs_list
         
-        print(f"[BatchDetection] SAM: Processing {len(images)} images")
+        batch_size = images.shape[0]
+        print(f"[BatchDetection] SAM: Processing {batch_size} images")
         
         processed_segs_list = []
         
         # Process SAM for each image - SAM typically works on single images
-        for i, (image, segs) in enumerate(zip(images, segs_list)):
+        for i in range(batch_size):
+            segs = segs_list[i]
             if len(segs[1]) == 0:
                 processed_segs_list.append(segs)
                 continue
                 
+            image = images[i:i+1]  # Keep batch dimension but extract single image
             sam_mask = core.make_sam_mask(sam_model_opt, segs, image, sam_detection_hint, sam_dilation,
                                           sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold,
                                           sam_mask_hint_use_negative)
@@ -2629,17 +2640,20 @@ class DetailerForBatch:
                        dyn_denoise_size_3, dyn_denoise_level_3,
                        target_width, target_height, noise_mask_feather=0, tiled_encode=False, tiled_decode=False):
 
-        # Ensure images is a list and handle single image case
-        if not isinstance(images, list):
-            images = [images]
+        # Convert to list for indexing if needed
+        if isinstance(images, torch.Tensor):
+            images_list = [images[i:i+1] for i in range(images.shape[0])]
+        else:
+            images_list = images if isinstance(images, list) else [images]
         
         all_face_data = []
+        enhanced_faces_list = []  # Collect enhanced faces for output
         
         size_thresholds = [dyn_denoise_size_1, dyn_denoise_size_2, dyn_denoise_size_3]
         denoise_levels = [dyn_denoise_level_1, dyn_denoise_level_2, dyn_denoise_level_3]
 
         # Collect all face data from all images
-        for img_idx, (image, segs) in enumerate(zip(images, segs_list)):
+        for img_idx, (image, segs) in enumerate(zip(images_list, segs_list)):
             segs = core.segs_scale_match(segs, image.shape)
             
             for seg_idx, seg in enumerate(segs[1]):
@@ -2649,9 +2663,11 @@ class DetailerForBatch:
                 # Get dynamic denoise level
                 denoise_value, level_num = DetailerForBatch.get_dynamic_denoise(face_percentage, size_thresholds, denoise_levels)
                 
-                # Extract face crop using PyTorch (GPU-optimized)
-                x1, y1, x2, y2 = seg.crop_region
-                cropped_image = image[:, y1:y2, x1:x2, :]
+                # Extract face crop using the same method as regular DetailerForEach
+                cropped_image = crop_ndarray4(image.cpu().numpy(), seg.crop_region)  # Same as regular DetailerForEach
+                cropped_image = to_tensor(cropped_image)  # Convert back to tensor properly
+
+                print(f"    -> Cropped image crop region: {seg.crop_region}")
                 
                 # Skip empty masks
                 is_mask_all_zeros = (seg.cropped_mask == 0).all().item()
@@ -2659,15 +2675,23 @@ class DetailerForBatch:
                     print(f"DetailerBatch: Skipping empty mask - Image {img_idx}, Face {seg_idx}")
                     continue
                 
+                # Process mask properly like regular DetailerForEach does
+                mask = to_tensor(seg.cropped_mask)
+                mask = tensor_gaussian_blur_mask(mask, feather)
+                # Remove extra dimensions that tensor_gaussian_blur_mask might add
+                while len(mask.shape) > 2:
+                    mask = mask.squeeze()
+                
                 face_data = {
                     'image_idx': img_idx,
+                    'seg_idx': seg_idx,  # Add seg_idx for better tracking
                     'cropped_image': cropped_image,
                     'seg': seg,
                     'denoise': denoise_value,
                     'level': level_num,
                     'face_percentage': face_percentage,
                     'original_size': (cropped_image.shape[1], cropped_image.shape[2]),  # height, width
-                    'mask': to_tensor(seg.cropped_mask)
+                    'mask': mask  # Now properly processed mask like regular DetailerForEach
                 }
                 
                 all_face_data.append(face_data)
@@ -2680,6 +2704,9 @@ class DetailerForBatch:
         for denoise_val, face_group in denoise_groups.items():
             if denoise_val == "SKIP":
                 print(f"[DetailerBatch] Skipping {len(face_group)} large faces (>= {dyn_denoise_size_3}% of image)")
+                # Add original faces to enhanced_faces_list for skipped faces
+                for face_data in face_group:
+                    enhanced_faces_list.append(face_data['cropped_image'])
                 continue
             
             print(f"[DetailerBatch] Processing {len(face_group)} faces with denoise level {denoise_val}")
@@ -2687,8 +2714,8 @@ class DetailerForBatch:
             if not face_group:
                 continue
                 
-            # Calculate target size for this group
-            face_crops = [face_data['cropped_image'] for face_data in face_group]
+            # Process faces in this denoise group efficiently
+            # No need to create intermediate lists
             
             print(f"[DetailerBatch] Target size: {target_width}x{target_height}")
             
@@ -2699,26 +2726,47 @@ class DetailerForBatch:
                 face_data['resized_face'] = resized_face
                 face_data['padding_info'] = padding_info
                 
-                # Resize mask as well with same padding
-                resized_mask, _ = DetailerForBatch.resize_face_crop_with_padding(
-                    face_data['mask'].unsqueeze(-1), target_width, target_height)
-                face_data['resized_mask'] = resized_mask.squeeze(-1)
+                print(f"  DEBUG: Face {face_data['image_idx']}.{face_data.get('seg_idx', '?')}")
+                print(f"    -> Original cropped_image shape: {face_data['cropped_image'].shape}")
+                print(f"    -> Original mask shape: {face_data['mask'].shape}")
+                print(f"    -> Resized face shape: {resized_face.shape}")
+                print(f"    -> Will use original mask for final blending")
+                print(f"    -> Padding info: {padding_info}")
             
 
             batch_size = len(face_group)
             print(f"[DetailerBatch] TRUE BATCH: Processing {batch_size} faces simultaneously at {target_width}x{target_height} with denoise {denoise_val}")
                 
-            # Create batched tensors - all faces same size, same denoise level  
-            batch_faces = torch.cat([face_data['resized_face'] for face_data in face_group], dim=0)
+            # Create batched tensors efficiently - all faces same size, same denoise level
+            # Pre-allocate batch tensor and copy data
+            first_face = face_group[0]['resized_face']
+            batch_faces = torch.empty((batch_size, *first_face.shape[1:]), 
+                                    dtype=first_face.dtype, device=first_face.device)
+            for i, face_data in enumerate(face_group):
+                batch_faces[i:i+1] = face_data['resized_face']
                 
             # Process conditioning (same for all faces in this denoise group)
             batch_positive, batch_negative = DetailerForBatch.process_batch_conditioning(
                 positive, negative, face_group)
                 
-            # Create batch masks if needed
+            # Create batch masks if needed (resize to match batch face dimensions)
             batch_masks = None
             if noise_mask:
-                batch_masks = [face_data['resized_mask'] for face_data in face_group]
+                batch_masks = []
+                for face_data in face_group:
+                    # Convert 2D mask to 4D for tensor_resize
+                    mask = face_data['mask']
+                    if mask.ndim == 2:  # [H, W] -> [1, H, W, 1]
+                        mask = mask.unsqueeze(0).unsqueeze(-1)
+                    
+                    # Resize mask to target size for noise masking during batch processing
+                    mask_resized = DetailerForBatch.tensor_resize_hq(mask, target_width, target_height)
+                    
+                    # Convert back to 2D for noise masking
+                    while len(mask_resized.shape) > 2:
+                        mask_resized = mask_resized.squeeze()
+                    
+                    batch_masks.append(mask_resized)
                 
             print(f"  -> Batch tensor shape: {batch_faces.shape}, seed: {seed}")
                 
@@ -2740,11 +2788,24 @@ class DetailerForBatch:
                     enhanced_face, face_data['padding_info'], original_height, original_width)
                     
                 face_data['enhanced_face'] = enhanced_face_resized
+                
+                # Add enhanced face to collection (in original size for output)
+                enhanced_faces_list.append(enhanced_face_resized)
+                
+                # Use the original mask directly since enhanced face is back to original size
+                face_data['final_mask'] = face_data['mask']  # Original mask is perfect!
+                
+                print(f"  DEBUG: After enhance_detail_batch Face {i+1}")
+                print(f"    -> Enhanced face shape: {enhanced_face.shape}")
+                print(f"    -> Enhanced face resized shape: {enhanced_face_resized.shape}")
+                print(f"    -> Using original mask shape: {face_data['final_mask'].shape}")
+                print(f"    -> Target original size: {original_width}x{original_height}")
+                
                 print(f"    -> Face {i+1} resized back to {original_width}x{original_height}")
             
         
         # Reconstruct enhanced images using core functions
-        for img_idx, image in enumerate(images):
+        for img_idx, image in enumerate(images_list):
             # Find all faces for this image
             image_faces = [face_data for face_data in all_face_data if face_data['image_idx'] == img_idx]
             
@@ -2754,62 +2815,84 @@ class DetailerForBatch:
                     seg = face_data['seg']
                     enhanced_face = face_data['enhanced_face']
                     
-                    # Create feathered mask for pasting
-                    mask = face_data['mask']
+                    # Use the properly resized mask that follows the same padding logic
+                    mask = face_data['final_mask']
                     mask = tensor_gaussian_blur_mask(mask, feather)
+                    # Remove extra dimensions that tensor_gaussian_blur_mask might add
+                    while len(mask.shape) > 2:
+                        mask = mask.squeeze()
                     
-                    # Paste enhanced face back to image (GPU-optimized)
-                    # Create feathered mask for blending
+                    # Extract the exact crop region dimensions from seg (this matches the original cropped area)
+                    crop_x, crop_y, crop_x2, crop_y2 = seg.crop_region
+                    crop_w = crop_x2 - crop_x
+                    crop_h = crop_y2 - crop_y
+                    
+                    # Verify enhanced face matches expected crop region size
+                    expected_h, expected_w = crop_h, crop_w
+                    actual_h, actual_w = enhanced_face.shape[1], enhanced_face.shape[2]
+                    
+                    print(f"    -> Crop region: ({crop_x}, {crop_y}) to ({crop_x2}, {crop_y2}) = {crop_w}x{crop_h}")
+                    print(f"    -> Enhanced face size: {actual_w}x{actual_h}")
+                    print(f"    -> Expected size: {expected_w}x{expected_h}")
+                    
+                    # If sizes don't match, resize enhanced face to crop region size
+                    # This shoudnt happen, but just in case
+                    if actual_h != expected_h or actual_w != expected_w:
+                        print(f"    -> Resizing enhanced face from {actual_w}x{actual_h} to {expected_w}x{expected_h}")
+                        enhanced_face = DetailerForBatch.tensor_resize_hq(enhanced_face, expected_w, expected_h)
+                    
+                    # Force CPU processing like regular DetailerForEach for proper blending
+                    image = image.cpu()
+                    enhanced_face = enhanced_face.cpu()
+                    
+                    # Prepare mask in NHWC format for tensor_paste
                     blend_mask = mask
-                    if blend_mask.shape != enhanced_face.shape[:3]:  # Ensure mask matches face dimensions
-                        blend_mask = tensor_resize(blend_mask, enhanced_face.shape[2], enhanced_face.shape[1])
+                    if blend_mask.ndim == 2:  # [H, W] -> [1, H, W, 1]
+                        blend_mask = blend_mask.unsqueeze(0).unsqueeze(-1)
+                    elif blend_mask.ndim == 3:  # [B, H, W] -> [B, H, W, 1] or [H, W, C] -> [1, H, W, C]
+                        if blend_mask.shape[0] == crop_h:  # [H, W, C] format
+                            blend_mask = blend_mask.unsqueeze(0)
+                        else:  # [B, H, W] format
+                            blend_mask = blend_mask.unsqueeze(-1)
                     
-                    # Extract crop region coordinates
-                    crop_x, crop_y = seg.crop_region[0], seg.crop_region[1]
-                    crop_h, crop_w = enhanced_face.shape[1], enhanced_face.shape[2]
+                    # Use high-quality tensor_paste for proper blending like regular DetailerForEach
+                    from impact.utils import tensor_paste
+                    tensor_paste(image, enhanced_face, (crop_x, crop_y), blend_mask)
                     
-                    # Ensure we don't exceed image boundaries
-                    crop_x = max(0, min(crop_x, image.shape[2] - crop_w))
-                    crop_y = max(0, min(crop_y, image.shape[1] - crop_h))
-                    crop_h = min(crop_h, image.shape[1] - crop_y)
-                    crop_w = min(crop_w, image.shape[2] - crop_x)
-                    
-                    # GPU-based blending using mask
-                    blend_mask_expanded = blend_mask[:, :crop_h, :crop_w].unsqueeze(-1)  # Add channel dimension
-                    
-                    # Blend enhanced face with original image region
-                    original_region = image[:, crop_y:crop_y+crop_h, crop_x:crop_x+crop_w, :]
-                    enhanced_region = enhanced_face[:, :crop_h, :crop_w, :]
-                    
-                    # Apply mask blending (mask acts as alpha for enhanced face)
-                    blended_region = original_region * (1 - blend_mask_expanded) + enhanced_region * blend_mask_expanded
-                    
-                    # Update the image in place on GPU
-                    image[:, crop_y:crop_y+crop_h, crop_x:crop_x+crop_w, :] = blended_region
+                    print(f"    -> Used tensor_paste for high-quality blending at ({crop_x}, {crop_y})")
                     
                     # Update the images list with the modified image
-                    images[img_idx] = image
+                    images_list[img_idx] = image
         
-        # Convert to RGB and prepare final result
-        enhanced_images = []
-        for img in images:
-            # Convert to RGB and remove batch dimension if it was added
-            rgb_img = tensor_convert_rgb(img)
-            if rgb_img.shape[0] == 1:  # Remove batch dimension if it's size 1
-                rgb_img = rgb_img.squeeze(0)
-            enhanced_images.append(rgb_img)
-        
-        # Stack all enhanced images into a batch
-        if enhanced_images:
-            # Ensure all images have the same dimensions for stacking
-            if len(enhanced_images[0].shape) == 3:  # Single images
-                batch_result = torch.stack(enhanced_images, dim=0)
-            else:  # Already batched
-                batch_result = torch.cat(enhanced_images, dim=0)
+        # Stack enhanced images back into batch and convert to RGB exactly like regular DetailerForEach
+        if images_list:
+            # Stack the images first, then convert to RGB (like DetailerForEach line 385)
+            batch_images = torch.cat(images_list, dim=0)
+            batch_result = tensor_convert_rgb(batch_images)
         else:
-            batch_result = torch.stack([img.squeeze(0) if img.shape[0] == 1 else img for img in images], dim=0)
+            # Fallback if no images - match the input tensor format
+            if len(images.shape) == 4:
+                batch_result = torch.empty((0, images.shape[1], images.shape[2], images.shape[3]), dtype=images.dtype, device=images.device)
+            else:
+                batch_result = torch.empty((0, 512, 512, 3), dtype=torch.float32)
         
-        return batch_result
+        # Prepare enhanced faces for output - convert to RGB and return as list (not concatenated tensor)
+        if enhanced_faces_list:
+            # Convert all enhanced faces to RGB format exactly like regular DetailerForEach
+            enhanced_faces_rgb = []
+            for face in enhanced_faces_list:
+                # Apply tensor_convert_rgb exactly like regular DetailerForEach does
+                face_rgb = tensor_convert_rgb(face)
+                enhanced_faces_rgb.append(face_rgb)
+            
+            # Return as list since faces have different dimensions
+            enhanced_faces_batch = enhanced_faces_rgb
+        else:
+            # Fallback if no enhanced faces - create proper empty tensor
+            empty_face = torch.empty((1, 64, 64, 3), dtype=torch.float32)
+            enhanced_faces_batch = [empty_face]
+        
+        return batch_result, enhanced_faces_batch
 
 
 class FaceDetailerBatch:
@@ -2860,14 +2943,14 @@ class FaceDetailerBatch:
                      "sam_model_opt": ("SAM_MODEL", ),
                      },
                 "optional": {
-                    "inpaint_model": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                     "noise_mask_feather": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                     "tiled_encode": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                     "tiled_decode": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                 }}
 
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("images", "masks")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
+    RETURN_NAMES = ("images", "masks", "enhanced_faces")
+    OUTPUT_IS_LIST = (False, False, True)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Simple"
@@ -2895,17 +2978,17 @@ class FaceDetailerBatch:
         print(f"  - Size <= {dyn_denoise_size_2}%: denoise {dyn_denoise_level_2}")
         print(f"  - Size <= {dyn_denoise_size_3}%: denoise {dyn_denoise_level_3}")
         print(f"  - Anything above is SKIPPED")
-        # Convert tensor to list of individual images
-        image_list = [images[i:i+1] for i in range(images.shape[0])]
+        # Work with tensor directly instead of creating unnecessary list
+        # image_list = [images[i:i+1] for i in range(images.shape[0])]
         
-        # Batch BBOX detection
+        # Batch BBOX detection - pass tensor directly
         segs_list = DetailerForBatch.detect_faces_batch(
-            image_list, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
+            images, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
 
         # Batch SAM processing (if enabled)
         if sam_model_opt is not None:
             segs_list = DetailerForBatch.apply_sam_batch(
-                image_list, segs_list, sam_model_opt, sam_detection_hint, sam_dilation,
+                images, segs_list, sam_model_opt, sam_detection_hint, sam_dilation,
                 sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold, sam_mask_hint_use_negative)
 
         # Generate masks
@@ -2915,8 +2998,8 @@ class FaceDetailerBatch:
             masks_list.append(mask)
 
         # Process batch with enhanced face detailing
-        enhanced_images = DetailerForBatch.do_detail_batch(
-            image_list, segs_list, model, clip, vae, seed, steps, cfg,
+        enhanced_images, enhanced_faces = DetailerForBatch.do_detail_batch(
+            images, segs_list, model, clip, vae, seed, steps, cfg,
             sampler_name, scheduler, positive, negative, feather, noise_mask,
             dyn_denoise_size_1, dyn_denoise_level_1,
             dyn_denoise_size_2, dyn_denoise_level_2,
@@ -2927,5 +3010,5 @@ class FaceDetailerBatch:
         # Combine masks
         combined_masks = torch.cat(masks_list, dim=0)
 
-        return enhanced_images, combined_masks
+        return enhanced_images, combined_masks, enhanced_faces
 
