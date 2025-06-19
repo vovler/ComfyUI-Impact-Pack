@@ -408,6 +408,62 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
     return refined_image, cnet_pils
 
 
+def enhance_detail_batch(face_batch, model, clip, vae, seed, steps, cfg, sampler_name, scheduler, 
+                       positive, negative, denoise, noise_masks, noise_mask_feather=0, 
+                       vae_tiled_encode=False, vae_tiled_decode=False):
+    """Simplified batch processing for faces with same dimensions and denoise level.
+    
+    Input faces are already cropped and resized to target dimensions.
+    No upscaling/downscaling needed - just encode, sample, and decode.
+    """
+    
+    batch_size = face_batch.shape[0]
+    print(f"DetailerBatch: Processing {batch_size} faces with denoise {denoise}")
+    
+    # Apply noise mask feather if needed
+    if noise_masks is not None and noise_mask_feather > 0:
+        processed_masks = []
+        for mask in noise_masks:
+            processed_mask = utils.tensor_gaussian_blur_mask(mask, noise_mask_feather)
+            processed_mask = processed_mask.squeeze(3) if len(processed_mask.shape) > 3 else processed_mask
+            processed_masks.append(processed_mask)
+        noise_masks = processed_masks
+
+    if noise_mask_feather > 0 and 'denoise_mask_function' not in model.model_options:
+        model = nodes_differential_diffusion.DifferentialDiffusion().apply(model)[0]
+
+    # Encode batch to latents
+    batch_latents = to_latent_image(face_batch, vae, vae_tiled_encode=vae_tiled_encode)
+    
+    # Add noise masks if provided
+    if noise_masks is not None:
+        if isinstance(noise_masks, list):
+            batch_latents['noise_mask'] = torch.stack(noise_masks, dim=0)
+        else:
+            batch_latents['noise_mask'] = noise_masks
+
+    # Batch sampling - all faces get same seed for natural variation
+    refined_latent = impact_sampling.ksampler_wrapper(
+        model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
+        batch_latents, denoise, refiner_ratio=None, refiner_model=None, 
+        refiner_clip=None, refiner_positive=None, refiner_negative=None,
+        noise=None, scheduler_func=None, sampler_opt=None
+    )
+
+    # Decode batch back to images
+    if vae_tiled_decode:
+        refined_batch = nodes.VAEDecodeTiled().decode(vae, refined_latent, 512)[0]
+    else:
+        try:
+            refined_batch = vae.decode(refined_latent['samples'])
+        except Exception as e:
+            # Fallback to tiled decode on memory issues
+            refined_batch = vae.decode_tiled(refined_latent["samples"], tile_x=64, tile_y=64)
+
+    # Keep on GPU - let caller decide device placement
+    return refined_batch
+
+
 def enhance_detail_for_animatediff(image_frames, model, clip, vae, guide_size, guide_size_for_bbox, max_size, bbox, seed, steps, cfg,
                                    sampler_name,
                                    scheduler, positive, negative, denoise, noise_mask,
@@ -429,133 +485,6 @@ def enhance_detail_for_animatediff(image_frames, model, clip, vae, guide_size, g
             positive = nodes.ConditioningConcat().concat(positive, wildcard_positive)[0]
         else:
             positive = wildcard_positive
-
-    h = image_frames.shape[1]
-    w = image_frames.shape[2]
-
-    bbox_h = bbox[3] - bbox[1]
-    bbox_w = bbox[2] - bbox[0]
-
-    # Skip processing if the detected bbox is already larger than the guide_size
-    if guide_size_for_bbox:  # == "bbox"
-        # Scale up based on the smaller dimension between width and height.
-        upscale = guide_size / min(bbox_w, bbox_h)
-    else:
-        # for cropped_size
-        upscale = guide_size / min(w, h)
-
-    new_w = int(w * upscale)
-    new_h = int(h * upscale)
-
-    # safeguard
-    if 'aitemplate_keep_loaded' in model.model_options:
-        max_size = min(4096, max_size)
-
-    if new_w > max_size or new_h > max_size:
-        upscale *= max_size / max(new_w, new_h)
-        new_w = int(w * upscale)
-        new_h = int(h * upscale)
-
-    if upscale <= 1.0 or new_w == 0 or new_h == 0:
-        print(f"Detailer: force inpaint")
-        upscale = 1.0
-        new_w = w
-        new_h = h
-
-    if detailer_hook is not None:
-        new_w, new_h = detailer_hook.touch_scaled_size(new_w, new_h)
-
-    print(f"Detailer: segment upscale for ({bbox_w, bbox_h}) | crop region {w, h} x {upscale} -> {new_w, new_h}")
-
-    # upscale the mask tensor by a factor of 2 using bilinear interpolation
-    if isinstance(noise_mask, np.ndarray):
-        noise_mask = torch.from_numpy(noise_mask)
-
-    if len(noise_mask.shape) == 2:
-        noise_mask = noise_mask.unsqueeze(0)
-    else:  # == 3
-        noise_mask = noise_mask
-
-    upscaled_mask = None
-
-    for single_mask in noise_mask:
-        single_mask = single_mask.unsqueeze(0).unsqueeze(0)
-        upscaled_single_mask = torch.nn.functional.interpolate(single_mask, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        upscaled_single_mask = upscaled_single_mask.squeeze(0)
-
-        if upscaled_mask is None:
-            upscaled_mask = upscaled_single_mask
-        else:
-            upscaled_mask = torch.cat((upscaled_mask, upscaled_single_mask), dim=0)
-
-    latent_frames = None
-    for image in image_frames:
-        image = torch.from_numpy(image).unsqueeze(0)
-
-        # upscale
-        upscaled_image = tensor_resize(image, new_w, new_h)
-
-        # ksampler
-        samples = to_latent_image(upscaled_image, vae)['samples']
-
-        if latent_frames is None:
-            latent_frames = samples
-        else:
-            latent_frames = torch.concat((latent_frames, samples), dim=0)
-
-    cnet_images = None
-    if control_net_wrapper is not None:
-        positive, negative, cnet_images = control_net_wrapper.apply(positive, negative, torch.from_numpy(image_frames), noise_mask, use_acn=True)
-
-    if len(upscaled_mask) != len(image_frames) and len(upscaled_mask) > 1:
-        print(f"[Impact Pack] WARN: DetailerForAnimateDiff - The number of the mask frames({len(upscaled_mask)}) and the image frames({len(image_frames)}) are different. Combine the mask frames and apply.")
-        combined_mask = upscaled_mask[0].to(torch.uint8)
-
-        for frame_mask in upscaled_mask[1:]:
-            combined_mask |= (frame_mask * 255).to(torch.uint8)
-
-        combined_mask = (combined_mask/255.0).to(torch.float32)
-
-        upscaled_mask = combined_mask.expand(len(image_frames), -1, -1)
-        upscaled_mask = utils.to_binary_mask(upscaled_mask, 0.1)
-
-    latent = {
-        'noise_mask': upscaled_mask,
-        'samples': latent_frames
-    }
-
-
-    sampler_opt=None
-    if detailer_hook is not None:
-        sampler_opt = detailer_hook.get_custom_sampler()
-
-    if detailer_hook is not None:
-        latent = detailer_hook.post_encode(latent)
-
-    refined_latent = impact_sampling.ksampler_wrapper(model, seed, steps, cfg, sampler_name, scheduler, positive, negative,
-                                                      latent, denoise, refiner_ratio, refiner_model, refiner_clip, refiner_positive, refiner_negative, scheduler_func=scheduler_func, sampler_opt=sampler_opt)
-
-    if detailer_hook is not None:
-        refined_latent = detailer_hook.pre_decode(refined_latent)
-
-    refined_image_frames = None
-    for refined_sample in refined_latent['samples']:
-        refined_sample = refined_sample.unsqueeze(0)
-
-        # non-latent downscale - latent downscale cause bad quality
-        refined_image = vae.decode(refined_sample)
-
-        if refined_image_frames is None:
-            refined_image_frames = refined_image
-        else:
-            refined_image_frames = torch.concat((refined_image_frames, refined_image), dim=0)
-
-    if detailer_hook is not None:
-        refined_image_frames = detailer_hook.post_decode(refined_image_frames)
-
-    refined_image_frames = nodes.ImageScale().upscale(image=refined_image_frames, upscale_method='lanczos', width=w, height=h, crop='disabled')[0]
-
-    return refined_image_frames, cnet_images
 
 
 def composite_to(dest_latent, crop_region, src_latent):
