@@ -420,14 +420,18 @@ def enhance_detail_batch(face_batch, model, clip, vae, seed, steps, cfg, sampler
     batch_size = face_batch.shape[0]
     print(f"DetailerBatch: Processing {batch_size} faces with denoise {denoise}")
     
-    # Apply noise mask feather if needed
+    # Apply noise mask feather if needed - optimize to avoid intermediate list
     if noise_masks is not None and noise_mask_feather > 0:
-        processed_masks = []
-        for mask in noise_masks:
+        # Process masks in-place to avoid creating new list
+        for i, mask in enumerate(noise_masks):
             processed_mask = utils.tensor_gaussian_blur_mask(mask, noise_mask_feather)
             processed_mask = processed_mask.squeeze(3) if len(processed_mask.shape) > 3 else processed_mask
-            processed_masks.append(processed_mask)
-        noise_masks = processed_masks
+
+            ## Remove all extra dimensions that tensor_gaussian_blur_mask might add
+            #while len(processed_mask.shape) > 2:
+            #    processed_mask = processed_mask.squeeze()
+            
+            noise_masks[i] = processed_mask
 
     if noise_mask_feather > 0 and 'denoise_mask_function' not in model.model_options:
         model = nodes_differential_diffusion.DifferentialDiffusion().apply(model)[0]
