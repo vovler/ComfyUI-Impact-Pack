@@ -1646,7 +1646,7 @@ class DetailerForEachTestPipe(DetailerForEachPipe):
     DESCRIPTION = DetailerForEach.DESCRIPTION
 
     def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-             denoise, feather, noise_mask, force_inpaint, basic_pipe, wildcard, detailer_hook, cycle=1,
+             denoise, feather, noise_mask, force_inpaint, basic_pipe, wildcard, detailer_hook=None, cycle=1,
              refiner_ratio=None, refiner_basic_pipe_opt=None, inpaint_model=False, noise_mask_feather=0,
              scheduler_func_opt=None, tiled_encode=False, tiled_decode=False):
 
@@ -2725,8 +2725,8 @@ class DetailerForBatch:
             # Process the ENTIRE BATCH simultaneously with same parameters
             enhanced_batch = core.enhance_detail_batch(
                 batch_faces, model, clip, vae, seed, steps, cfg, sampler_name, scheduler,
-                batch_positive, batch_negative, denoise_val, batch_masks, noise_mask_feather=noise_mask_feather, 
-                vae_tiled_encode=tiled_encode, vae_tiled_decode=tiled_decode)
+                batch_positive, batch_negative, denoise_val, batch_masks, noise_mask_feather=noise_mask_feather,
+                scheduler_func=None, vae_tiled_encode=tiled_encode, vae_tiled_decode=tiled_decode)
                 
             print(f"  -> Batch result shape: {enhanced_batch.shape}")
                 
