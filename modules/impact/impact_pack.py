@@ -1646,7 +1646,7 @@ class DetailerForEachTestPipe(DetailerForEachPipe):
     DESCRIPTION = DetailerForEach.DESCRIPTION
 
     def doit(self, image, segs, guide_size, guide_size_for, max_size, seed, steps, cfg, sampler_name, scheduler,
-             denoise, feather, noise_mask, force_inpaint, basic_pipe, wildcard, cycle=1,
+             denoise, feather, noise_mask, force_inpaint, basic_pipe, wildcard, detailer_hook, cycle=1,
              refiner_ratio=None, refiner_basic_pipe_opt=None, inpaint_model=False, noise_mask_feather=0,
              scheduler_func_opt=None, tiled_encode=False, tiled_decode=False):
 
@@ -2068,11 +2068,11 @@ class ImageReceiver:
                     mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
                     mask = 1. - torch.from_numpy(mask)
                 else:
-                    mask = torch.zeros((64, 64), dtype=torch.float32)
+                    mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
                 return (image, mask.unsqueeze(0))
             except Exception as e:
                 print(f"[WARN] ComfyUI-Impact-Pack: ImageReceiver - invalid 'image_data'")
-                mask = torch.zeros((64, 64), dtype=torch.float32)
+                mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
                 return (empty_pil_tensor(64, 64), mask, )
         else:
             return nodes.LoadImage().load_image(image)
