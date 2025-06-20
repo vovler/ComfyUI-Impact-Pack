@@ -410,7 +410,7 @@ def enhance_detail(image, model, clip, vae, guide_size, guide_size_for_bbox, max
 
 def enhance_detail_batch(face_batch, model, clip, vae, seed, steps, cfg, sampler_name, scheduler, 
                        positive, negative, denoise, noise_masks, noise_mask_feather=0, 
-                       scheduler_func=None, vae_tiled_encode=False, vae_tiled_decode=False):
+                       scheduler_func=None, vae_tiled_encode=False, vae_tiled_decode=False, debug_mode=False):
     """Simplified batch processing for faces with same dimensions and denoise level.
     
     Input faces are already cropped and resized to target dimensions.
@@ -418,7 +418,8 @@ def enhance_detail_batch(face_batch, model, clip, vae, seed, steps, cfg, sampler
     """
     
     batch_size = face_batch.shape[0]
-    print(f"DetailerBatch: Processing {batch_size} faces with denoise {denoise}")
+    if debug_mode:
+        print(f"DetailerBatch: Processing {batch_size} faces with denoise {denoise}")
     
     # Apply noise mask feather if needed - optimize to avoid intermediate list
     if noise_masks is not None and noise_mask_feather > 0:
