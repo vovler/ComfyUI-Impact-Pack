@@ -2586,10 +2586,11 @@ class DetailerForBatch:
         return batch_positive, batch_negative
 
     @staticmethod
-    def detect_faces_batch(images, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size):
+    def detect_faces_batch(images, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size, debug_mode=False):
         """Batch face detection using BBOX detector"""
         batch_size = images.shape[0]
-        print(f"[BatchDetection] BBOX: Processing {batch_size} images in batch")
+        if debug_mode:
+            print(f"[BatchDetection] BBOX: Processing {batch_size} images in batch")
         
         segs_list = []
         bbox_detector.setAux('face')
@@ -2599,19 +2600,21 @@ class DetailerForBatch:
             image = images[i:i+1]  # Keep batch dimension but extract single image
             segs = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
             segs_list.append(segs)
-            print(f"    -> Image {i+1}: Found {len(segs[1])} faces")
+            if debug_mode:
+                print(f"    -> Image {i+1}: Found {len(segs[1])} faces")
         
         bbox_detector.setAux(None)
         return segs_list
     
     @staticmethod
-    def apply_sam_batch(images, segs_list, sam_model_opt, sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold, sam_mask_hint_use_negative):
+    def apply_sam_batch(images, segs_list, sam_model_opt, sam_detection_hint, sam_dilation, sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold, sam_mask_hint_use_negative, debug_mode=False):
         """Apply SAM processing to detected faces in batch"""
         if sam_model_opt is None:
             return segs_list
         
         batch_size = images.shape[0]
-        print(f"[BatchDetection] SAM: Processing {batch_size} images")
+        if debug_mode:
+            print(f"[BatchDetection] SAM: Processing {batch_size} images")
         
         processed_segs_list = []
         
@@ -2628,7 +2631,8 @@ class DetailerForBatch:
                                           sam_mask_hint_use_negative)
             processed_segs = core.segs_bitwise_and_mask(segs, sam_mask)
             processed_segs_list.append(processed_segs)
-            print(f"    -> Image {i+1}: SAM refined to {len(processed_segs[1])} faces")
+            if debug_mode:
+                print(f"    -> Image {i+1}: SAM refined to {len(processed_segs[1])} faces")
         
         return processed_segs_list
 
@@ -2638,7 +2642,7 @@ class DetailerForBatch:
                        dyn_denoise_size_1, dyn_denoise_level_1,
                        dyn_denoise_size_2, dyn_denoise_level_2,
                        dyn_denoise_size_3, dyn_denoise_level_3,
-                       target_width, target_height, noise_mask_feather=0, tiled_encode=False, tiled_decode=False):
+                       target_width, target_height, noise_mask_feather=0, tiled_encode=False, tiled_decode=False, debug_mode=False):
 
         # Convert to list for indexing if needed
         if isinstance(images, torch.Tensor):
@@ -2647,7 +2651,8 @@ class DetailerForBatch:
             images_list = images if isinstance(images, list) else [images]
         
         all_face_data = []
-        enhanced_faces_list = []  # Collect enhanced faces for output
+        enhanced_faces_list = [] if debug_mode else None  # Collect enhanced faces for output only in debug mode
+        enhanced_faces_masked_list = [] if debug_mode else None  # Collect enhanced faces with masks applied for debug
         
         size_thresholds = [dyn_denoise_size_1, dyn_denoise_size_2, dyn_denoise_size_3]
         denoise_levels = [dyn_denoise_level_1, dyn_denoise_level_2, dyn_denoise_level_3]
@@ -2667,12 +2672,14 @@ class DetailerForBatch:
                 cropped_image = crop_ndarray4(image.cpu().numpy(), seg.crop_region)  # Same as regular DetailerForEach
                 cropped_image = to_tensor(cropped_image)  # Convert back to tensor properly
 
-                print(f"    -> Cropped image crop region: {seg.crop_region}")
+                if debug_mode:
+                    print(f"    -> Cropped image crop region: {seg.crop_region}")
                 
                 # Skip empty masks
                 is_mask_all_zeros = (seg.cropped_mask == 0).all().item()
                 if is_mask_all_zeros:
-                    print(f"DetailerBatch: Skipping empty mask - Image {img_idx}, Face {seg_idx}")
+                    if debug_mode:
+                        print(f"DetailerBatch: Skipping empty mask - Image {img_idx}, Face {seg_idx}")
                     continue
                 
                 # Process mask properly like regular DetailerForEach does
@@ -2695,7 +2702,8 @@ class DetailerForBatch:
                 }
                 
                 all_face_data.append(face_data)
-                print(f"Face {img_idx}.{seg_idx}: {face_percentage:.1f}% -> Level {level_num} (denoise: {denoise_value})")
+                if debug_mode:
+                    print(f"Face {img_idx}.{seg_idx}: {face_percentage:.1f}% -> Level {level_num} (denoise: {denoise_value})")
         
         # Group faces by denoise level for batch processing
         denoise_groups = DetailerForBatch.group_faces_by_denoise(all_face_data)
@@ -2703,13 +2711,33 @@ class DetailerForBatch:
         # Process each denoise group
         for denoise_val, face_group in denoise_groups.items():
             if denoise_val == "SKIP":
-                print(f"[DetailerBatch] Skipping {len(face_group)} large faces (>= {dyn_denoise_size_3}% of image)")
-                # Add original faces to enhanced_faces_list for skipped faces
-                for face_data in face_group:
-                    enhanced_faces_list.append(face_data['cropped_image'])
+                if debug_mode:
+                    print(f"[DetailerBatch] Skipping {len(face_group)} large faces (>= {dyn_denoise_size_3}% of image)")
+                # Add original faces to enhanced_faces_list for skipped faces (only in debug mode)
+                if debug_mode:
+                    for face_data in face_group:
+                        # Resize original face to target size to match other enhanced faces
+                        resized_face, _ = DetailerForBatch.resize_face_crop_with_padding(
+                            face_data['cropped_image'], target_width, target_height)
+                        enhanced_faces_list.append(resized_face)
+                        
+                        # For skipped faces, the masked version is the resized original with mask applied at target size
+                        mask_original = face_data['mask']
+                        if mask_original.ndim == 2:  # [H, W] -> [1, H, W, 1] for tensor_resize
+                            mask_for_resize = mask_original.unsqueeze(0).unsqueeze(-1)
+                        else:
+                            mask_for_resize = mask_original
+                        
+                        # Resize mask to target size
+                        mask_target_size = DetailerForBatch.tensor_resize_hq(mask_for_resize, target_width, target_height)
+                        original_masked = resized_face * mask_target_size
+                        # Clamp values to [0, 1] range to prevent overflow
+                        original_masked = torch.clamp(original_masked, 0.0, 1.0)
+                        enhanced_faces_masked_list.append(original_masked)
                 continue
             
-            print(f"[DetailerBatch] Processing {len(face_group)} faces with denoise level {denoise_val}")
+            if debug_mode:
+                print(f"[DetailerBatch] Processing {len(face_group)} faces with denoise level {denoise_val}")
             
             if not face_group:
                 continue
@@ -2717,7 +2745,8 @@ class DetailerForBatch:
             # Process faces in this denoise group efficiently
             # No need to create intermediate lists
             
-            print(f"[DetailerBatch] Target size: {target_width}x{target_height}")
+            if debug_mode:
+                print(f"[DetailerBatch] Target size: {target_width}x{target_height}")
             
             # Resize all faces to target size with padding to preserve aspect ratio
             for face_data in face_group:
@@ -2726,16 +2755,18 @@ class DetailerForBatch:
                 face_data['resized_face'] = resized_face
                 face_data['padding_info'] = padding_info
                 
-                print(f"  DEBUG: Face {face_data['image_idx']}.{face_data.get('seg_idx', '?')}")
-                print(f"    -> Original cropped_image shape: {face_data['cropped_image'].shape}")
-                print(f"    -> Original mask shape: {face_data['mask'].shape}")
-                print(f"    -> Resized face shape: {resized_face.shape}")
-                print(f"    -> Will use original mask for final blending")
-                print(f"    -> Padding info: {padding_info}")
+                if debug_mode:
+                    print(f"  DEBUG: Face {face_data['image_idx']}.{face_data.get('seg_idx', '?')}")
+                    print(f"    -> Original cropped_image shape: {face_data['cropped_image'].shape}")
+                    print(f"    -> Original mask shape: {face_data['mask'].shape}")
+                    print(f"    -> Resized face shape: {resized_face.shape}")
+                    print(f"    -> Will use original mask for final blending")
+                    print(f"    -> Padding info: {padding_info}")
             
 
             batch_size = len(face_group)
-            print(f"[DetailerBatch] TRUE BATCH: Processing {batch_size} faces simultaneously at {target_width}x{target_height} with denoise {denoise_val}")
+            if debug_mode:
+                print(f"[DetailerBatch] TRUE BATCH: Processing {batch_size} faces simultaneously at {target_width}x{target_height} with denoise {denoise_val}")
                 
             # Create batched tensors efficiently - all faces same size, same denoise level
             # Pre-allocate batch tensor and copy data
@@ -2768,40 +2799,59 @@ class DetailerForBatch:
                     
                     batch_masks.append(mask_resized)
                 
-            print(f"  -> Batch tensor shape: {batch_faces.shape}, seed: {seed}")
+            if debug_mode:
+                print(f"  -> Batch tensor shape: {batch_faces.shape}, seed: {seed}")
                 
             # Process the ENTIRE BATCH simultaneously with same parameters
             enhanced_batch = core.enhance_detail_batch(
                 batch_faces, model, clip, vae, seed, steps, cfg, sampler_name, scheduler,
                 batch_positive, batch_negative, denoise_val, batch_masks, noise_mask_feather=noise_mask_feather,
-                scheduler_func=None, vae_tiled_encode=tiled_encode, vae_tiled_decode=tiled_decode)
+                scheduler_func=None, vae_tiled_encode=tiled_encode, vae_tiled_decode=tiled_decode, debug_mode=debug_mode)
                 
-            print(f"  -> Batch result shape: {enhanced_batch.shape}")
+            if debug_mode:
+                print(f"  -> Batch result shape: {enhanced_batch.shape}")
                 
             # Split batch result back to individual faces and resize to original sizes
             for i, face_data in enumerate(face_group):
                 enhanced_face = enhanced_batch[i:i+1]  # Extract individual face from batch
+                
+                # Add enhanced face to collection at TARGET SIZE (before resize back, only in debug mode)
+                if debug_mode:
+                    enhanced_faces_list.append(enhanced_face)
                     
-                # Remove padding and resize back to original face size
+                    # Create masked version at target size - need to resize mask to target size first
+                    mask_original = face_data['mask']
+                    if mask_original.ndim == 2:  # [H, W] -> [1, H, W, 1] for tensor_resize
+                        mask_for_resize = mask_original.unsqueeze(0).unsqueeze(-1)
+                    else:
+                        mask_for_resize = mask_original
+                    
+                    # Resize mask to target size to match enhanced face
+                    mask_target_size = DetailerForBatch.tensor_resize_hq(mask_for_resize, target_width, target_height)
+                    
+                    # Apply mask to enhanced face at target size
+                    enhanced_face_masked = enhanced_face * mask_target_size
+                    # Clamp values to [0, 1] range to prevent overflow
+                    enhanced_face_masked = torch.clamp(enhanced_face_masked, 0.0, 1.0)
+                    enhanced_faces_masked_list.append(enhanced_face_masked)
+                    
+                # Remove padding and resize back to original face size for blending
                 original_height, original_width = face_data['original_size']
                 enhanced_face_resized = DetailerForBatch.remove_padding_and_resize_back(
                     enhanced_face, face_data['padding_info'], original_height, original_width)
                     
                 face_data['enhanced_face'] = enhanced_face_resized
                 
-                # Add enhanced face to collection (in original size for output)
-                enhanced_faces_list.append(enhanced_face_resized)
-                
                 # Use the original mask directly since enhanced face is back to original size
                 face_data['final_mask'] = face_data['mask']  # Original mask is perfect!
                 
-                print(f"  DEBUG: After enhance_detail_batch Face {i+1}")
-                print(f"    -> Enhanced face shape: {enhanced_face.shape}")
-                print(f"    -> Enhanced face resized shape: {enhanced_face_resized.shape}")
-                print(f"    -> Using original mask shape: {face_data['final_mask'].shape}")
-                print(f"    -> Target original size: {original_width}x{original_height}")
-                
-                print(f"    -> Face {i+1} resized back to {original_width}x{original_height}")
+                if debug_mode:
+                    print(f"  DEBUG: After enhance_detail_batch Face {i+1}")
+                    print(f"    -> Enhanced face shape: {enhanced_face.shape}")
+                    print(f"    -> Enhanced face resized shape: {enhanced_face_resized.shape}")
+                    print(f"    -> Using original mask shape: {face_data['final_mask'].shape}")
+                    print(f"    -> Target original size: {original_width}x{original_height}")
+                    print(f"    -> Face {i+1} resized back to {original_width}x{original_height}")
             
         
         # Reconstruct enhanced images using core functions
@@ -2831,14 +2881,16 @@ class DetailerForBatch:
                     expected_h, expected_w = crop_h, crop_w
                     actual_h, actual_w = enhanced_face.shape[1], enhanced_face.shape[2]
                     
-                    print(f"    -> Crop region: ({crop_x}, {crop_y}) to ({crop_x2}, {crop_y2}) = {crop_w}x{crop_h}")
-                    print(f"    -> Enhanced face size: {actual_w}x{actual_h}")
-                    print(f"    -> Expected size: {expected_w}x{expected_h}")
+                    if debug_mode:
+                        print(f"    -> Crop region: ({crop_x}, {crop_y}) to ({crop_x2}, {crop_y2}) = {crop_w}x{crop_h}")
+                        print(f"    -> Enhanced face size: {actual_w}x{actual_h}")
+                        print(f"    -> Expected size: {expected_w}x{expected_h}")
                     
                     # If sizes don't match, resize enhanced face to crop region size
                     # This shoudnt happen, but just in case
                     if actual_h != expected_h or actual_w != expected_w:
-                        print(f"    -> Resizing enhanced face from {actual_w}x{actual_h} to {expected_w}x{expected_h}")
+                        if debug_mode:
+                            print(f"    -> Resizing enhanced face from {actual_w}x{actual_h} to {expected_w}x{expected_h}")
                         enhanced_face = DetailerForBatch.tensor_resize_hq(enhanced_face, expected_w, expected_h)
                     
                     # Force CPU processing like regular DetailerForEach for proper blending
@@ -2859,7 +2911,8 @@ class DetailerForBatch:
                     from impact.utils import tensor_paste
                     tensor_paste(image, enhanced_face, (crop_x, crop_y), blend_mask)
                     
-                    print(f"    -> Used tensor_paste for high-quality blending at ({crop_x}, {crop_y})")
+                    if debug_mode:
+                        print(f"    -> Used tensor_paste for high-quality blending at ({crop_x}, {crop_y})")
                     
                     # Update the images list with the modified image
                     images_list[img_idx] = image
@@ -2876,8 +2929,12 @@ class DetailerForBatch:
             else:
                 batch_result = torch.empty((0, 512, 512, 3), dtype=torch.float32)
         
+        # Initialize output variables
+        enhanced_faces_batch = None
+        enhanced_faces_masked_batch = None
+        
         # Prepare enhanced faces for output - convert to RGB and return as list (not concatenated tensor)
-        if enhanced_faces_list:
+        if debug_mode and enhanced_faces_list:
             # Convert all enhanced faces to RGB format exactly like regular DetailerForEach
             enhanced_faces_rgb = []
             for face in enhanced_faces_list:
@@ -2887,12 +2944,19 @@ class DetailerForBatch:
             
             # Return as list since faces have different dimensions
             enhanced_faces_batch = enhanced_faces_rgb
-        else:
-            # Fallback if no enhanced faces - create proper empty tensor
-            empty_face = torch.empty((1, 64, 64, 3), dtype=torch.float32)
-            enhanced_faces_batch = [empty_face]
         
-        return batch_result, enhanced_faces_batch
+        # Prepare enhanced faces with masks applied for debug output
+        if debug_mode and enhanced_faces_masked_list:
+            # Convert masked enhanced faces to RGB format for debug output
+            enhanced_faces_masked_rgb = []
+            for face in enhanced_faces_masked_list:
+                face_rgb = tensor_convert_rgb(face)
+                # Clamp values to [0, 1] range to prevent overflow warnings
+                face_rgb = torch.clamp(face_rgb, 0.0, 1.0)
+                enhanced_faces_masked_rgb.append(face_rgb)
+            enhanced_faces_masked_batch = enhanced_faces_masked_rgb
+        
+        return batch_result, enhanced_faces_batch, enhanced_faces_masked_batch
 
 
 class FaceDetailerBatch:
@@ -2939,18 +3003,18 @@ class FaceDetailerBatch:
                      "drop_size": ("INT", {"min": 1, "max": MAX_RESOLUTION, "step": 1, "default": 32}),
 
                      "bbox_detector": ("BBOX_DETECTOR", ),
-
-                     "sam_model_opt": ("SAM_MODEL", ),
                      },
                 "optional": {
+                    "sam_model_opt": ("SAM_MODEL", ),
                     "noise_mask_feather": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                     "tiled_encode": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
                     "tiled_decode": ("BOOLEAN", {"default": False, "label_on": "enabled", "label_off": "disabled"}),
+                    "debug_mode": ("BOOLEAN", {"default": True, "label_on": "enabled", "label_off": "disabled", "tooltip": "Enable detailed debug output and additional return values"}),
                 }}
 
-    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
-    RETURN_NAMES = ("images", "masks", "enhanced_faces")
-    OUTPUT_IS_LIST = (False, False, True)
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("images", "masks", "enhanced_faces", "debug_bbox_crops", "debug_enhanced_faces_masked")
+    OUTPUT_IS_LIST = (False, False, True, True, True)
     FUNCTION = "doit"
 
     CATEGORY = "ImpactPack/Simple"
@@ -2966,49 +3030,119 @@ class FaceDetailerBatch:
              bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size, bbox_detector,
              sam_model_opt=None, sam_detection_hint="center-1", sam_dilation=0, sam_threshold=0.93, 
              sam_bbox_expansion=0, sam_mask_hint_threshold=0.7, sam_mask_hint_use_negative="False",
-             noise_mask_feather=20, tiled_encode=False, tiled_decode=False):
+             noise_mask_feather=20, tiled_encode=False, tiled_decode=False, debug_mode=False):
 
         # Handle single image input
         if len(images.shape) == 3:  # Single image without batch dimension
             images = images.unsqueeze(0)
         
-        print(f"[FaceDetailerBatch] Processing batch of {images.shape[0]} images")
-        print(f"[FaceDetailerBatch] Dynamic denoise levels:")
-        print(f"  - Size <= {dyn_denoise_size_1}%: denoise {dyn_denoise_level_1}")
-        print(f"  - Size <= {dyn_denoise_size_2}%: denoise {dyn_denoise_level_2}")
-        print(f"  - Size <= {dyn_denoise_size_3}%: denoise {dyn_denoise_level_3}")
-        print(f"  - Anything above is SKIPPED")
+        # Store original batch size for debug messages
+        original_batch_size = images.shape[0]
+        
+        # Filter out 1x1 images
+        valid_indices = []
+        filtered_images = []
+        
+        for i in range(images.shape[0]):
+            image = images[i]
+            height, width = image.shape[0], image.shape[1]
+            
+            if height > 1 or width > 1:  # Keep images that are NOT 1x1
+                valid_indices.append(i)
+                filtered_images.append(image.unsqueeze(0))
+            else:
+                if debug_mode:
+                    print(f"[FaceDetaillerBatch] Skipping 1x1 image at index {i}")
+        
+        # If no valid images remain, return empty results
+        if not filtered_images:
+            if debug_mode:
+                print(f"[FaceDetaillerBatch] No valid images to process (all {original_batch_size} were 1x1)")
+            
+            # Return empty tensors with appropriate shapes
+            empty_images = torch.empty((0, 512, 512, 3), dtype=torch.float32, device=images.device)
+            empty_masks = torch.empty((0, 512, 512), dtype=torch.float32, device=images.device)
+            empty_list = []
+            
+            return empty_images, empty_masks, empty_list, empty_list, empty_list
+        
+        # Concatenate filtered images back into batch tensor
+        images = torch.cat(filtered_images, dim=0)
+        skipped_count = original_batch_size - images.shape[0]
+        
+        if debug_mode:
+            if skipped_count > 0:
+                print(f"[FaceDetaillerBatch] Processing batch of {images.shape[0]} valid images (skipped {skipped_count} 1x1 images from original {original_batch_size})")
+            else:
+                print(f"[FaceDetaillerBatch] Processing batch of {images.shape[0]} images")
+            print(f"[FaceDetaillerBatch] Dynamic denoise levels:")
+            print(f"  - Size <= {dyn_denoise_size_1}%: denoise {dyn_denoise_level_1}")
+            print(f"  - Size <= {dyn_denoise_size_2}%: denoise {dyn_denoise_level_2}")
+            print(f"  - Size <= {dyn_denoise_size_3}%: denoise {dyn_denoise_level_3}")
+            print(f"  - Anything above is SKIPPED")
         # Work with tensor directly instead of creating unnecessary list
         # image_list = [images[i:i+1] for i in range(images.shape[0])]
         
         # Batch BBOX detection - pass tensor directly
         segs_list = DetailerForBatch.detect_faces_batch(
-            images, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size)
+            images, bbox_detector, bbox_threshold, bbox_dilation, bbox_crop_factor, drop_size, debug_mode)
+
+        # Debug: Extract and show detected face crops from BBOX detection
+        debug_bbox_crops = []
+        if debug_mode:
+            for img_idx, segs in enumerate(segs_list):
+                image = images[img_idx:img_idx+1]  # Keep batch dimension
+                segs = core.segs_scale_match(segs, image.shape)
+                for seg_idx, seg in enumerate(segs[1]):
+                    # Extract the same crop that DetailerForBatch will process
+                    cropped_image = crop_ndarray4(image.cpu().numpy(), seg.crop_region)
+                    cropped_image = to_tensor(cropped_image)
+                    debug_bbox_crops.append(cropped_image)
+                    print(f"    -> Debug: Extracted BBOX crop {img_idx}.{seg_idx} with shape {cropped_image.shape}, crop_region: {seg.crop_region}")
 
         # Batch SAM processing (if enabled)
         if sam_model_opt is not None:
             segs_list = DetailerForBatch.apply_sam_batch(
                 images, segs_list, sam_model_opt, sam_detection_hint, sam_dilation,
-                sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold, sam_mask_hint_use_negative)
+                sam_threshold, sam_bbox_expansion, sam_mask_hint_threshold, sam_mask_hint_use_negative, debug_mode)
 
-        # Generate masks
-        masks_list = []
-        for segs in segs_list:
-            mask = core.segs_to_combined_mask(segs)
-            masks_list.append(mask)
+        # Generate masks (only if debug mode is on to save memory)
+        if debug_mode:
+            masks_list = []
+            for segs in segs_list:
+                mask = core.segs_to_combined_mask(segs)
+                masks_list.append(mask)
+        else:
+            # Create minimal empty mask for non-debug mode
+            masks_list = [torch.zeros((1, images.shape[1], images.shape[2]), dtype=torch.float32, device=images.device)]
 
         # Process batch with enhanced face detailing
-        enhanced_images, enhanced_faces = DetailerForBatch.do_detail_batch(
+        enhanced_images, enhanced_faces, enhanced_faces_masked = DetailerForBatch.do_detail_batch(
             images, segs_list, model, clip, vae, seed, steps, cfg,
             sampler_name, scheduler, positive, negative, feather, noise_mask,
             dyn_denoise_size_1, dyn_denoise_level_1,
             dyn_denoise_size_2, dyn_denoise_level_2,
             dyn_denoise_size_3, dyn_denoise_level_3,
             target_width, target_height, noise_mask_feather=noise_mask_feather, 
-            tiled_encode=tiled_encode, tiled_decode=tiled_decode)
+            tiled_encode=tiled_encode, tiled_decode=tiled_decode, debug_mode=debug_mode)
 
         # Combine masks
         combined_masks = torch.cat(masks_list, dim=0)
 
-        return enhanced_images, combined_masks, enhanced_faces
+        # Convert debug BBOX crops to RGB format for output
+        if debug_mode and debug_bbox_crops:
+            debug_bbox_crops_rgb = []
+            for crop in debug_bbox_crops:
+                crop_rgb = tensor_convert_rgb(crop)
+                # Clamp values to [0, 1] range to prevent overflow warnings
+                crop_rgb = torch.clamp(crop_rgb, 0.0, 1.0)
+                debug_bbox_crops_rgb.append(crop_rgb)
+
+        if debug_mode:
+            return enhanced_images, combined_masks, enhanced_faces, debug_bbox_crops_rgb, enhanced_faces_masked
+        else:
+            # Non-debug mode: return minimal outputs to save memory
+            minimal_mask = torch.zeros((1, 1, 1), dtype=torch.float32, device=images.device)
+            minimal_image = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=images.device)
+            return enhanced_images, minimal_mask, [minimal_image], [minimal_image], [minimal_image]
 
